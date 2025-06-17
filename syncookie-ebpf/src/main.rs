@@ -4,6 +4,7 @@
 mod binding;
 mod vmlinux;
 
+use aya_ebpf::helpers::gen::bpf_xdp_get_buff_len;
 use aya_ebpf::{
     bindings::{__be32, __s32, xdp_action, xdp_md},
     helpers::r#gen::{bpf_csum_diff, bpf_ktime_get_ns, bpf_xdp_adjust_tail},
@@ -20,6 +21,7 @@ use network_types::{
 
 use crate::binding::{bpf_tcp_raw_check_syncookie_ipv4, bpf_tcp_raw_gen_syncookie_ipv4};
 
+const TCP_OFFSET: usize = EthHdr::LEN + Ipv4Hdr::LEN; // Max TCP header size is 60 bytes
 const TCPOPT_NOP: u8 = 1;
 const TCPOPT_EOL: u8 = 0;
 const TCPOPT_MSS: u8 = 2;
@@ -366,14 +368,18 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
     if 2.eq(&tcp_flag) {
         // tcp_len = doff() x 4
         // tcp_off = EthHdr::LEN + Ipv4Hdr::LEN
-        let tcp_buff_cap: u64 = (packet_len as u64) - (Ipv4Hdr::LEN as u64);
-        let ret = unsafe { bpf_xdp_adjust_tail(ctx.ctx, (60u64 - tcp_buff_cap) as i32) };
+        let current_xdp_len = unsafe { bpf_xdp_get_buff_len(ctx.ctx) } - TCP_OFFSET as u64;
+        let header_len = (header_ref.doff() * 4) as u32;
+        let ret = unsafe { bpf_xdp_adjust_tail(ctx.ctx, 60i32 - current_xdp_len as i32) };
         if 0.ne(&ret) {
             info!(&ctx, "Cannot Adjust_Tail");
             return Err(xdp_action::XDP_ABORTED);
         }
 
-        let header_len = (header_ref.doff() * 4) as u32;
+        let (ether, ether_ref) = unsafe { ptr_at::<EthHdr>(&ctx, 0)? };
+        let (ipv, ipv_ref) = unsafe { ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN)? };
+        let (header, header_ref) = unsafe { ptr_at::<TcpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)? };
+
         let raw_cookie = unsafe {
             bpf_tcp_raw_gen_syncookie_ipv4(
                 ipv as *mut _,
@@ -536,88 +542,3 @@ fn panic(_info: &core::panic::PanicInfo) -> ! {
 #[link_section = "license"]
 #[no_mangle]
 static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
-// let new_flag: u32 = (*header)._bitfield_1.get(8, 6u8) as u32;
-// if let Some(check) = csum_diff(
-//     &(tcp_flag as u32).to_be(),
-//     &new_flag.to_be(),
-//     !((*header).check as u32),
-// ) {
-//     (*header).check = csum_fold(check);
-// }
-//
-// if let Some(check) = csum_diff(
-//     &header_ref.ack_seq,
-//     &(u32::from_be((*header).seq) + 1).to_be(),
-//     !((*header).check as u32),
-// ) {
-//     (*header).check = csum_fold(check);
-//     (*header).ack_seq = (u32::from_be((*header).seq) + 1).to_be();
-// }
-
-// if header_ref.doff() > 5 {
-//     //recalc the checksum
-//     let mut option_offset = EthHdr::LEN + Ipv4Hdr::LEN + TcpHdr::LEN;
-//     for _ in 0..8 {
-//         if option_offset as u16 >= { *ipv }.total_len() {
-//             break;
-//         }
-//         if ptr_at::<*mut u8>(&ctx, option_offset).is_err() {
-//             break;
-//         }
-//         let (_, option_type_pointer_ref) = ptr_at::<u8>(&ctx, option_offset)?;
-//         let option_type = option_type_pointer_ref.to_le();
-//         if TCPOPT_EOL.eq(&option_type) {
-//             break;
-//         }
-//         if TCPOPT_NOP.eq(&option_type) {
-//             option_offset += 1;
-//             continue;
-//         }
-//         if ptr_at::<*mut u8>(&ctx, option_offset + 1).is_err() {
-//             break;
-//         }
-//         let (_, option_len_pointer_ref) = ptr_at::<u8>(&ctx, option_offset + 1)?;
-//         let option_len = option_len_pointer_ref.to_le();
-//         if TCPOPT_MSS.eq(&option_type) {
-//             let (mss, mss_ref) = ptr_at::<u16>(&ctx, option_offset + 2usize)?;
-//             if let Some(check) =
-//                 csum_diff(mss_ref, &cookie.mss.to_be(), !((*header).check as u32))
-//             {
-//                 (*header).check = csum_fold(check);
-//                 *mss = cookie.mss.to_be();
-//             }
-//         }
-//         if TCPOPT_TIMESTAMP.ne(&option_type) {
-//             option_offset += option_len as usize;
-//             continue;
-//         }
-//
-//         let (option_data_timestamp_pointer, option_data_timestamp_pointer_ref) =
-//             ptr_at::<u32>(&ctx, option_offset + 2)?;
-//
-//         let (
-//             option_data_timestamp_echo_pointer,
-//             option_data_timestamp_echo_pointer_ref,
-//         ) = ptr_at::<u32>(&ctx, option_offset + 6)?;
-//
-//         if let Some(check) = csum_diff(
-//             option_data_timestamp_echo_pointer_ref,
-//             option_data_timestamp_pointer_ref,
-//             !((*header).check as u32),
-//         ) {
-//             (*header).check = csum_fold(check);
-//             *option_data_timestamp_echo_pointer = *option_data_timestamp_pointer;
-//         }
-//
-//         let tsval = (bpf_ktime_get_ns() >> 16) as u32;
-//         if let Some(check) = csum_diff(
-//             &(*option_data_timestamp_pointer),
-//             &tsval.to_be(),
-//             !((*header).check as u32),
-//         ) {
-//             (*header).check = csum_fold(check);
-//             (*option_data_timestamp_pointer) = tsval.to_be();
-//         }
-//         break;
-//     }
-// }
