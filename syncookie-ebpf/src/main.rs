@@ -6,7 +6,7 @@ mod vmlinux;
 
 use aya_ebpf::helpers::gen::bpf_xdp_get_buff_len;
 use aya_ebpf::{
-    bindings::{__be32, __s32, xdp_action, xdp_md},
+    bindings::{__be32, __s32, xdp_action},
     helpers::r#gen::{bpf_csum_diff, bpf_ktime_get_ns, bpf_xdp_adjust_tail},
     macros::xdp,
     programs::XdpContext,
@@ -20,6 +20,8 @@ use network_types::{
 };
 
 use crate::binding::{bpf_tcp_raw_check_syncookie_ipv4, bpf_tcp_raw_gen_syncookie_ipv4};
+
+const MAX_PACKETS_LEN: usize = EthHdr::LEN + Ipv4Hdr::LEN + 60; // 60 is max TCP header size
 
 const TCP_OFFSET: usize = EthHdr::LEN + Ipv4Hdr::LEN; // Max TCP header size is 60 bytes
 const TCPOPT_NOP: u8 = 1;
@@ -296,17 +298,26 @@ fn timestamp_cookie(ctx: &XdpContext, tcp_hdr: &TcpHdr) -> TcpOptionsContext {
 }
 
 #[inline(always)]
-unsafe fn make_tcp_options(data: &mut usize, tsecr: u16, tsval: u16, wscale: u8, mss: u16) -> u16 {
-    let start = *data as u16;
-    let data_ptr = *data as *mut u32;
+unsafe fn make_tcp_options(
+    ctx: &XdpContext,
+    start_offset: usize,
+    tsecr: u16,
+    tsval: u16,
+    wscale: u8,
+    mss: u16,
+) -> u16 {
+    let mut curent_offset = start_offset;
+    let mut doff = 0;
+    let data_ptr = (ctx.data() + curent_offset) as *mut u32;
     (*data_ptr) = ((TCPOPT_MSS as u32) << 24 | ((TCPOLEN_MSS as u32) << 16) | (mss as u32)).to_be();
-    *data += 1;
+    curent_offset += mem::size_of::<u32>();
+    doff += 1;
 
     if tsecr == 0 {
-        return *data as u16 - start;
+        return doff;
     }
 
-    let data_ptr = *data as *mut u32;
+    let data_ptr = (ctx.data() + curent_offset) as *mut u32;
     if (tsval & (1u16 << 4).to_be()) != 0 {
         (*data_ptr) = ((TCPOPT_SACK_PERM as u32) << 24
             | (TCPOLEN_SACK_PERM as u32) << 16
@@ -320,13 +331,15 @@ unsafe fn make_tcp_options(data: &mut usize, tsecr: u16, tsval: u16, wscale: u8,
             | TCPOLEN_TIMESTAMP as u32)
             .to_be();
     }
-    *data += 1;
+    curent_offset += mem::size_of::<u32>();
+    doff += 1;
 
-    let data_ptr = *data as *mut u32;
+    let data_ptr = (ctx.data() + curent_offset) as *mut u32;
     (*data_ptr) = ((tsval as u32) << 16 | tsecr as u32).to_be();
-    *data += 1;
+    curent_offset += mem::size_of::<u32>();
+    doff += 1;
 
-    let data_ptr = *data as *mut u32;
+    let data_ptr = (ctx.data() + curent_offset) as *mut u32;
     if (tsval & 0xfu16.to_be()) != 0xfu16.to_be() {
         (*data_ptr) = ((TCPOPT_NOP as u32) << 24
             | (TCPOPT_WINDOW as u32) << 16
@@ -334,8 +347,8 @@ unsafe fn make_tcp_options(data: &mut usize, tsecr: u16, tsval: u16, wscale: u8,
             | wscale as u32)
             .to_be();
     }
-    *data += 1;
-    (*data as u16) - start
+    doff += 1;
+    doff
 }
 
 // ---------------- XDP ----------------------
@@ -375,11 +388,20 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
             info!(&ctx, "Cannot Adjust_Tail");
             return Err(xdp_action::XDP_ABORTED);
         }
+        let start = ctx.data();
+        let end = ctx.data_end();
+        if start + MAX_PACKETS_LEN > end {
+            info!(
+                &ctx,
+                "Packet too short for max TCP options after adjust_tail"
+            );
+            return Err(xdp_action::XDP_ABORTED);
+        }
 
         let (ether, ether_ref) = unsafe { ptr_at::<EthHdr>(&ctx, 0)? };
         let (ipv, ipv_ref) = unsafe { ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN)? };
         let (header, header_ref) = unsafe { ptr_at::<TcpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)? };
-
+        // Explicitly check for the maximum TCP header size for the verifier
         let raw_cookie = unsafe {
             bpf_tcp_raw_gen_syncookie_ipv4(
                 ipv as *mut _,
@@ -398,9 +420,51 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
         let tcp_options = timestamp_cookie(&ctx, header_ref);
 
         unsafe {
+            let doff = make_tcp_options(
+                &ctx,
+                TCP_OFFSET + TcpHdr::LEN,
+                tcp_options.tsval,
+                tcp_options.tsecr,
+                tcp_options.wscale,
+                cookie.mss,
+            );
+            (*header).set_doff(5 + doff);
+            let tcp_len = (*header).doff() * 4;
+            if tcp_len > 60 {
+                return Err(xdp_action::XDP_ABORTED);
+            }
+
+            let new_len = (size_of::<Ipv4Hdr>() as u16) + tcp_len;
+            let new_len_ip_payload = tcp_len; // New IP payload length is just the TCP header length
+            let final_xdp_len =
+                EthHdr::LEN as i32 + Ipv4Hdr::LEN as i32 + new_len_ip_payload as i32;
+            let current_xdp_len_after_options = ctx.data_end() - ctx.data(); // Get current length after make_tcp_options
+
+            // Second adjust_tail to finalize packet length
+            let adjust_delta_2 = final_xdp_len - (current_xdp_len_after_options as i32);
+            let ret = bpf_xdp_adjust_tail(ctx.ctx, adjust_delta_2);
+            if 0.ne(&ret) {
+                info!(&ctx, "Cannot Adjust_Tail (second)");
+                return Err(xdp_action::XDP_ABORTED);
+            }
+            if ctx.data_end() <= ctx.data()
+                || ctx.data_end() < (ctx.data() + final_xdp_len as usize)
+            {
+                info!(
+                    &ctx,
+                    "Packet too short for max TCP options after adjust_tail"
+                );
+                return Err(xdp_action::XDP_ABORTED);
+            }
+
+            let (ether, ether_ref) = ptr_at::<EthHdr>(&ctx, 0)?;
+            let (ipv, ipv_ref) = ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN)?;
+            let (header, header_ref) = ptr_at::<TcpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)?;
+
             mem::swap(&mut (*ether).src_addr, &mut (*ether).dst_addr);
             mem::swap(&mut (*ipv).src_addr, &mut (*ipv).dst_addr);
             mem::swap(&mut (*header).source, &mut (*header).dest);
+            (*ipv).set_total_len(new_len);
             (*ipv).ttl = DEFAULT_TTL.to_be();
             (*ipv).tos = 0;
             (*ipv).set_id(0);
@@ -416,17 +480,6 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
             (*header).window = 0;
             (*header).urg_ptr = 0;
             (*header).check = 0;
-            let doff = make_tcp_options(
-                &mut ctx.data(),
-                tcp_options.tsval,
-                tcp_options.tsecr,
-                tcp_options.wscale,
-                cookie.mss,
-            );
-            (*header).set_doff(5 + doff);
-            let tcp_len = (*header).doff() * 4;
-            let new_len = (size_of::<Ipv4Hdr>() as u16) + tcp_len;
-            (*ipv).set_total_len(new_len);
 
             let full_sum = bpf_csum_diff(
                 mem::MaybeUninit::zeroed().assume_init(),
@@ -452,13 +505,6 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
                 tcp_header_sum,
             );
             (*header).check = tcp_sum;
-            let old_len = (Ipv4Hdr::LEN + 60) as i32;
-            let new_len = Ipv4Hdr::LEN as i32 + tcp_len as i32;
-            let ret = bpf_xdp_adjust_tail(ctx.ctx, new_len - old_len);
-            if 0.ne(&ret) {
-                info!(&ctx, "Cannot Adjust_Tail");
-                return Err(xdp_action::XDP_ABORTED);
-            }
         }
         info!(
             &ctx,
