@@ -1,17 +1,14 @@
 #![no_std]
 #![no_main]
 
-mod binding;
-mod vmlinux;
-
-// use aya_ebpf::bindings::xdp_md;
-use aya_ebpf::helpers::gen::bpf_xdp_get_buff_len;
-use aya_ebpf::macros::map;
 use aya_ebpf::maps::HashMap;
 use aya_ebpf::{
-    bindings::{__be32, __s32, xdp_action},
-    helpers::r#gen::{bpf_csum_diff, bpf_ktime_get_ns, bpf_xdp_adjust_tail},
-    macros::xdp,
+    bindings::xdp_action,
+    helpers::gen::{
+        bpf_csum_diff, bpf_ktime_get_ns, bpf_tcp_raw_check_syncookie_ipv4,
+        bpf_tcp_raw_gen_syncookie_ipv4, bpf_xdp_adjust_tail, bpf_xdp_get_buff_len,
+    },
+    macros::{map, xdp},
     programs::XdpContext,
 };
 use aya_log_ebpf::info;
@@ -21,8 +18,6 @@ use network_types::{
     ip::{IpProto, Ipv4Hdr},
     tcp::TcpHdr,
 };
-
-use crate::binding::{bpf_tcp_raw_check_syncookie_ipv4, bpf_tcp_raw_gen_syncookie_ipv4};
 
 const MAX_PACKETS_LEN: usize = EthHdr::LEN + Ipv4Hdr::LEN + 60; // 60 is max TCP header size
 
@@ -46,12 +41,12 @@ const TCPOLEN_WINDOW: u8 = 3;
 const TCPOLEN_SACK_PERM: u8 = 2;
 const TCPOLEN_TIMESTAMP: u8 = 10;
 
-const IPS_CONFIRMED_BIT: u16 = 3;
-const IPS_CONFIRMED: u16 = 1 << IPS_CONFIRMED_BIT;
+// const IPS_CONFIRMED_BIT: u16 = 3;
+// const IPS_CONFIRMED: u16 = 1 << IPS_CONFIRMED_BIT;
 
 // const ETH_P_8021Q: u16 = 0x8100; /* 802.1Q VLAN Extended Header  */
 // const ETH_P_8021AD: u16 = 0x88A8; /* 802.1ad Service VLAN		*/
-const BPF_F_CURRENT_NETNS: __s32 = -1;
+// const BPF_F_CURRENT_NETNS: __s32 = -1;
 
 const DEFAULT_MSS4: u16 = 1460;
 // const DEFAULT_MSS6: u16 = 1440;
@@ -85,30 +80,31 @@ pub struct nf_conn {}
 //status live at bytes 128-136
 
 // ---------------- FUNCTION ----------------------
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct BpfCtOptsLocal {
-    pub netns_id: __s32,
-    pub error: __s32,
-    pub l4proto: u8,
-    pub dir: u8,
-    pub reserved: [u8; 2],
-}
-const CT_OPTS_LEN: u32 = size_of::<BpfCtOptsLocal>() as u32;
+// #[repr(C)]
+// #[derive(Copy, Clone)]
+// pub struct BpfCtOptsLocal {
+//     pub netns_id: __s32,
+//     pub error: __s32,
+//     pub l4proto: u8,
+//     pub dir: u8,
+//     pub reserved: [u8; 2],
+// }
+// const CT_OPTS_LEN: u32 = size_of::<BpfCtOptsLocal>() as u32;
+//
+// impl BpfCtOptsLocal {
+//     fn new_ipv4() -> Self {
+//         Self {
+//             netns_id: BPF_F_CURRENT_NETNS,
+//             error: 0,
+//             l4proto: 6, // TCP
+//             dir: 0,
+//             reserved: [0; 2],
+//         }
+//     }
+// }
 
-impl BpfCtOptsLocal {
-    fn new_ipv4() -> Self {
-        Self {
-            netns_id: BPF_F_CURRENT_NETNS,
-            error: 0,
-            l4proto: 6, // TCP
-            dir: 0,
-            reserved: [0; 2],
-        }
-    }
-}
-
-// #[allow(improper_ctypes)]
+// Required ksyms/kfunc support in Aya first
+// // #[allow(improper_ctypes)]
 // extern "C" {
 //     fn bpf_xdp_ct_lookup(
 //         ctx: *mut xdp_md,
@@ -173,20 +169,20 @@ fn csum_ipv4_magic(saddr: u32, daddr: u32, len: u16, proto: u8, csum: u64) -> u1
     csum_fold_helper(sum)
 }
 
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct BpfSockTuple {
-    pub ipv4: Ipv4Tuple,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct Ipv4Tuple {
-    pub saddr: __be32,
-    pub daddr: __be32,
-    pub sport: u16,
-    pub dport: u16,
-}
+// #[repr(C)]
+// #[derive(Copy, Clone)]
+// pub struct BpfSockTuple {
+//     pub ipv4: Ipv4Tuple,
+// }
+//
+// #[repr(C)]
+// #[derive(Copy, Clone)]
+// pub struct Ipv4Tuple {
+//     pub saddr: u32,
+//     pub daddr: u32,
+//     pub sport: u16,
+//     pub dport: u16,
+// }
 
 // #[inline(always)]
 // fn tcp_lookup(ctx: &XdpContext, ipv: &Ipv4Hdr, tcp_hdr: &TcpHdr) -> Result<bool, u32> {
