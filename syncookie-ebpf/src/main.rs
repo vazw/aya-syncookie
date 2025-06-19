@@ -5,8 +5,8 @@ use aya_ebpf::maps::HashMap;
 use aya_ebpf::{
     bindings::xdp_action,
     helpers::gen::{
-        bpf_csum_diff, bpf_ktime_get_ns, bpf_tcp_raw_check_syncookie_ipv4,
-        bpf_tcp_raw_gen_syncookie_ipv4, bpf_xdp_adjust_tail, bpf_xdp_get_buff_len,
+        bpf_csum_diff, bpf_ktime_get_ns, bpf_tcp_raw_gen_syncookie_ipv4, bpf_xdp_adjust_tail,
+        bpf_xdp_get_buff_len,
     },
     macros::{map, xdp},
     programs::XdpContext,
@@ -48,7 +48,7 @@ const TCPOLEN_TIMESTAMP: u8 = 10;
 // const ETH_P_8021AD: u16 = 0x88A8; /* 802.1ad Service VLAN		*/
 // const BPF_F_CURRENT_NETNS: __s32 = -1;
 
-const DEFAULT_MSS4: u16 = 1460;
+// const DEFAULT_MSS4: u16 = 1460;
 // const DEFAULT_MSS6: u16 = 1440;
 const DEFAULT_WSCALE: u8 = 7;
 const DEFAULT_TTL: u8 = 64;
@@ -63,20 +63,14 @@ struct TcpOptionsContext {
 
 #[derive(Debug, Clone, Copy)]
 pub struct CookieResult {
-    _pad: u16,
     pub mss: u16,
+    __pading: u16,
     pub seq: u32,
 }
 
-impl CookieResult {
-    pub fn new(seq: u32, mss: u16) -> Self {
-        Self { _pad: 0, seq, mss }
-    }
-}
-
-#[repr(C)]
-#[derive(Copy, Clone)]
-pub struct nf_conn {}
+// #[repr(C)]
+// #[derive(Copy, Clone)]
+// pub struct nf_conn {}
 //status live at bytes 128-136
 
 // ---------------- FUNCTION ----------------------
@@ -377,7 +371,7 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
     if EtherType::Ipv4 != ether_type {
         return Ok(xdp_action::XDP_PASS);
     }
-    let (ipv, ipv_ref) = unsafe { ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN)? };
+    let (_, ipv_ref) = unsafe { ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN)? };
     let remote_addr = ipv_ref.src_addr();
     let server_addr = ipv_ref.dst_addr();
     // let packet_len = ipv_ref.total_len();
@@ -385,7 +379,7 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
     if IpProto::Tcp.ne(&protocal) {
         return Ok(xdp_action::XDP_PASS);
     }
-    let (header, header_ref) = unsafe { ptr_at::<TcpHdr>(&ctx, TCP_OFFSET)? };
+    let (_, header_ref) = unsafe { ptr_at::<TcpHdr>(&ctx, TCP_OFFSET)? };
     let tcp_flag: u8 = header_ref._bitfield_1.get(8, 6u8) as u8;
     let remote_port = u16::from_be(header_ref.source);
     let server_port = u16::from_be(header_ref.dest);
@@ -434,7 +428,6 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
         let _ = unsafe { ptr_at::<EthHdr>(&ctx, 0)? };
         let (ipv, _) = unsafe { ptr_at::<Ipv4Hdr>(&ctx, EthHdr::LEN)? };
         let (header, header_ref) = unsafe { ptr_at::<TcpHdr>(&ctx, EthHdr::LEN + Ipv4Hdr::LEN)? };
-        // Explicitly check for the maximum TCP header size for the verifier
         let raw_cookie = unsafe {
             bpf_tcp_raw_gen_syncookie_ipv4(
                 ipv as *mut _,
@@ -448,7 +441,11 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
             info!(&ctx, "raw_cookie {}", raw_cookie);
             return Err(xdp_action::XDP_ABORTED);
         };
-        let cookie = raw_cookie as u32;
+        let cookie = unsafe { mem::transmute::<i64, CookieResult>(raw_cookie) };
+        info!(
+            &ctx,
+            "cookie seq:{} mss:{}", cookie.seq, cookie.mss, cookie._pad
+        );
         let tcp_options = timestamp_cookie(&ctx, header_ref);
 
         unsafe {
@@ -458,7 +455,7 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
                 tcp_options.tsecr,
                 tcp_options.tsval,
                 tcp_options.wscale,
-                DEFAULT_MSS4,
+                cookie.mss,
             );
             (*header).set_doff(5 + doff);
             let tcp_len = (*header).doff() * 4;
@@ -477,7 +474,7 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
             mem::swap(&mut (*header).source, &mut (*header).dest);
             (*ipv).set_total_len(new_len);
             (*ipv).ttl = DEFAULT_TTL.to_be();
-            // (*ipv).tos = 0;
+            (*ipv).tos = 0;
             (*ipv).set_id(0);
             (*ipv).set_checksum(0);
 
@@ -487,9 +484,9 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
                 (*header).set_ece(1);
             }
             (*header).ack_seq = (u32::from_be((*header).seq) + 1).to_be();
-            (*header).seq = cookie.to_be();
-            // (*header).window = 0;
-            // (*header).urg_ptr = 0;
+            (*header).seq = cookie.seq.to_be();
+            (*header).window = 65160u16.to_be();
+            (*header).urg_ptr = 0;
             (*header).check = 0;
 
             let full_sum = bpf_csum_diff(
@@ -551,75 +548,74 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
             server_port,
             remote_addr,
             remote_port,
-            cookie,
+            cookie.seq,
         );
         Ok(xdp_action::XDP_TX)
-    } else if 16.eq(&tcp_flag) {
-        //Ack
-        // bpf_xdp_ct_lookup and bpf_ct_release are'nt here yet
-        // if let Ok(connected) = tcp_lookup(&ctx, ipv_ref, header_ref) {
-        if let Some(connected) = unsafe { CONNECTIONS.get(&remote_addr.to_bits()) } {
-            if *connected != 0 {
-                info!(
-                    &ctx,
-                    "PASS CT_TCP ACK host:{:i}:{} <-- remote:{:i}:{}",
-                    server_addr,
-                    server_port,
-                    remote_addr,
-                    remote_port,
-                );
-                Ok(xdp_action::XDP_PASS)
-            } else {
-                info!(
-                    &ctx,
-                    "Aborted CT_ERROR host:{:i}:{} <-- remote:{:i}:{}",
-                    server_addr,
-                    server_port,
-                    remote_addr,
-                    remote_port,
-                );
-                Err(xdp_action::XDP_DROP)
-            }
-        } else {
-            let result =
-                unsafe { bpf_tcp_raw_check_syncookie_ipv4(ipv as *mut _, header as *mut _) };
-            if result != 0 {
-                info!(
-                    &ctx,
-                    "DROP Invalid Cookie host:{:i}:{} <-- remote:{:i}:{} ={}",
-                    server_addr,
-                    server_port,
-                    remote_addr,
-                    remote_port,
-                    result
-                );
-                Ok(xdp_action::XDP_DROP)
-            } else {
-                _ = CONNECTIONS.insert(&remote_addr.to_bits(), &1, 0);
-                info!(
-                    &ctx,
-                    "PASS SynCookie host:{:i}:{} <-- remote:{:i}:{}",
-                    server_addr,
-                    server_port,
-                    remote_addr,
-                    remote_port,
-                );
-                Ok(xdp_action::XDP_PASS)
-            }
-        }
-    } else if 18.eq(&tcp_flag) {
-        //syn-ack
-        _ = CONNECTIONS.insert(&remote_addr.to_bits(), &1, 0);
-        info!(
-            &ctx,
-            "PASS SynAckRequest host:{:i}:{} <-- remote:{:i}:{}",
-            server_addr,
-            server_port,
-            remote_addr,
-            remote_port,
-        );
-        Ok(xdp_action::XDP_PASS)
+    // } else if 16.eq(&tcp_flag) {
+    //Ack
+    // bpf_xdp_ct_lookup and bpf_ct_release are'nt here yet
+    // if let Ok(connected) = tcp_lookup(&ctx, ipv_ref, header_ref) {
+    // if let Some(connected) = unsafe { CONNECTIONS.get(&remote_addr.to_bits()) } {
+    // if *connected != 0 {
+    //     info!(
+    //         &ctx,
+    //         "PASS CT_TCP ACK host:{:i}:{} <-- remote:{:i}:{}",
+    //         server_addr,
+    //         server_port,
+    //         remote_addr,
+    //         remote_port,
+    //     );
+    //     Ok(xdp_action::XDP_PASS)
+    // } else {
+    // let result =
+    //     unsafe { bpf_tcp_raw_check_syncookie_ipv4(ipv as *mut _, header as *mut _) };
+    // if result != 0 {
+    //     info!(
+    //         &ctx,
+    //         "DROP Invalid Cookie host:{:i}:{} <-- remote:{:i}:{} ={}",
+    //         server_addr,
+    //         server_port,
+    //         remote_addr,
+    //         remote_port,
+    //         result
+    //     );
+    //     Ok(xdp_action::XDP_DROP)
+    // } else {
+    //     _ = CONNECTIONS.insert(&remote_addr.to_bits(), &1, 0);
+    //     info!(
+    //         &ctx,
+    //         "PASS SynCookie host:{:i}:{} <-- remote:{:i}:{}",
+    //         server_addr,
+    //         server_port,
+    //         remote_addr,
+    //         remote_port,
+    //     );
+    //     Ok(xdp_action::XDP_PASS)
+    // }
+    //     info!(
+    //         &ctx,
+    //         "Aborted CT_ERROR host:{:i}:{} <-- remote:{:i}:{}",
+    //         server_addr,
+    //         server_port,
+    //         remote_addr,
+    //         remote_port,
+    //     );
+    //     Err(xdp_action::XDP_DROP)
+    // }
+    // } else if 18.eq(&tcp_flag) {
+    //     //syn-ack
+    //     _ = CONNECTIONS.insert(&remote_addr.to_bits(), &1, 0);
+    //     info!(
+    //         &ctx,
+    //         "PASS SynAckRequest host:{:i}:{} <-- remote:{:i}:{}",
+    //         server_addr,
+    //         server_port,
+    //         remote_addr,
+    //         remote_port,
+    //     );
+    //     Ok(xdp_action::XDP_PASS)
     } else {
+        _ = CONNECTIONS.insert(&remote_addr.to_bits(), &1, 0);
         info!(
             &ctx,
             "PASS Not_FILTERED host:{:i}:{} <-- remote:{:i}:{}",
