@@ -409,7 +409,7 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
         // tcp_len = doff() x 4
         // tcp_off = EthHdr::LEN + Ipv4Hdr::LEN
         let current_xdp_len = unsafe { bpf_xdp_get_buff_len(ctx.ctx) } - TCP_OFFSET as u64;
-        let header_len = (header_ref.doff() * 4) as u32;
+        let tcp_len = (header_ref.doff() * 4) as u32;
         let ret = unsafe { bpf_xdp_adjust_tail(ctx.ctx, 60i32 - current_xdp_len as i32) };
         if 0.ne(&ret) {
             info!(&ctx, "Cannot Adjust_Tail");
@@ -432,7 +432,7 @@ fn try_syncookie(ctx: XdpContext) -> Result<u32, u32> {
             bpf_tcp_raw_gen_syncookie_ipv4(
                 ipv as *mut _,
                 header as *mut _,
-                header_len, // (header.doff() * 4) as u32,
+                tcp_len, // (header.doff() * 4) as u32,
             )
         } as i64;
         // On failure, the returned value is one of the following:
